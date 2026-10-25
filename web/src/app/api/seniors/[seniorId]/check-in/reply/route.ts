@@ -11,6 +11,12 @@ import { getCurrentCaregiver } from "@/lib/session";
 // emergency number, and an alert raised now, not when the senior taps Finish
 // (they may never tap it).
 
+// Gemini reasons before every reply, and the model list falls through on a
+// slow or failing model (12 s each). Without this, a slow turn could be cut
+// off by the platform's default function limit and reach the senior as an
+// error.
+export const maxDuration = 60;
+
 export async function POST(request: Request, { params }: { params: Promise<{ seniorId: string }> }) {
   const [{ seniorId }, caregiver] = await Promise.all([params, getCurrentCaregiver()]);
 
