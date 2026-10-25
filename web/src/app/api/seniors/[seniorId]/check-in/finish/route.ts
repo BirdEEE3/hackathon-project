@@ -14,6 +14,9 @@ import { getCurrentCaregiver } from "@/lib/session";
 // Ends a check-in: Gemini turns the conversation into a note for the family,
 // the note is stored, and the transcript is dropped.
 
+// See reply/route.ts: the same model calls, the same reason.
+export const maxDuration = 60;
+
 export async function POST(request: Request, { params }: { params: Promise<{ seniorId: string }> }) {
   const [{ seniorId }, caregiver] = await Promise.all([params, getCurrentCaregiver()]);
 

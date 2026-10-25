@@ -45,6 +45,52 @@ function pickVoice(): SpeechSynthesisVoice | undefined {
   );
 }
 
+let chosenVoice: Promise<SpeechSynthesisVoice | null> | null = null;
+
+/**
+ * The one voice used for every line, chosen once. Browsers load their voice
+ * list asynchronously, so picking per line meant the greeting played in the
+ * default voice and every later line in the chosen one. Waits for the list
+ * (briefly) and then sticks with the answer, even if it is "the default".
+ */
+function theVoice(): Promise<SpeechSynthesisVoice | null> {
+  chosenVoice ??= new Promise((resolve) => {
+    const synth = window.speechSynthesis;
+    if (!synth) return resolve(null);
+    const pick = () => resolve(pickVoice() ?? null); // later calls are no-ops
+    if (synth.getVoices().length > 0) return pick();
+    synth.addEventListener("voiceschanged", pick, { once: true });
+    setTimeout(pick, 1500);
+  });
+  return chosenVoice;
+}
+
+function utterance(text: string, voice: SpeechSynthesisVoice | null): SpeechSynthesisUtterance {
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 0.92;
+  if (voice) {
+    u.voice = voice;
+    u.lang = voice.lang;
+  }
+  return u;
+}
+
+/**
+ * Joins everything heard so far. Android Chrome repeats the whole phrase in
+ * each new result instead of only the new words, so a result that starts
+ * with what we already have replaces it rather than being appended.
+ */
+function transcriptOf(results: ArrayLike<ArrayLike<{ transcript: string }>>): string {
+  let text = "";
+  for (let i = 0; i < results.length; i++) {
+    const t = results[i]![0]!.transcript.trim();
+    if (!t) continue;
+    if (text && t.toLowerCase().startsWith(text.toLowerCase())) text = t;
+    else text = text ? `${text} ${t}` : t;
+  }
+  return text;
+}
+
 const STATUS: Record<Phase, string> = {
   speaking: "Speaking…",
   listening: "Listening…",
@@ -54,8 +100,18 @@ const STATUS: Record<Phase, string> = {
   done: "",
 };
 
-/** Ends the turn after the senior's last long pause, for long answers on continuous engines. */
-const MAX_LISTEN_MS = 30_000;
+// Listening is continuous, and the senior's turn ends on our own silence
+// timer rather than the browser's. The browser's ends at the first short
+// pause, which cut slower speakers off mid-sentence and sent the model half
+// a thought.
+/** A pause this long, after they've said something, ends their turn. */
+const SILENCE_MS = 2200;
+/** Nothing at all for this long: stop and let them tap when ready. */
+const NOTHING_HEARD_MS = 12_000;
+/** Hard cap on one answer. */
+const MAX_LISTEN_MS = 60_000;
+/** Gap after the assistant stops talking, so the mic doesn't catch its own voice. */
+const LISTEN_DELAY_MS = 600;
 
 export function CheckIn({
   seniorId,
@@ -67,6 +123,11 @@ export function CheckIn({
   greeting: string;
 }) {
   const [open, setOpen] = useState(false);
+
+  // Start loading voices now, so the very first line can use the chosen one.
+  useEffect(() => {
+    void theVoice();
+  }, []);
 
   return (
     <>
@@ -148,36 +209,38 @@ function Conversation({
     const rec = new Rec();
     rec.lang = navigator.language || "en-US";
     rec.interimResults = true;
-    rec.continuous = false;
-    let finalText = "";
+    rec.continuous = true;
+    // Interim words included: when the turn ends on our timer, the last
+    // phrase is often still interim, and dropping it lost their final words.
+    let heardSoFar = "";
+    let silence = setTimeout(() => rec.stop(), NOTHING_HEARD_MS);
     const giveUp = setTimeout(() => rec.stop(), MAX_LISTEN_MS);
 
     rec.onresult = (e) => {
-      let interim = "";
-      finalText = "";
-      for (let i = 0; i < e.results.length; i++) {
-        const r = e.results[i]!;
-        if (r.isFinal) finalText += r[0]!.transcript;
-        else interim += r[0]!.transcript;
-      }
-      setHeard((finalText + interim).trim());
+      heardSoFar = transcriptOf(e.results);
+      setHeard(heardSoFar);
+      clearTimeout(silence);
+      silence = setTimeout(() => rec.stop(), SILENCE_MS);
     };
     rec.onerror = (e) => {
       if (e.error === "not-allowed" || e.error === "service-not-allowed") {
         voiceMode.current = false;
         setTyping(true);
         setNotice("The microphone is turned off for this site, so let's type instead.");
-      } else if (e.error === "no-speech") {
-        setNotice("I didn't hear anything. Tap the circle and try again.");
       }
     };
     rec.onend = () => {
+      clearTimeout(silence);
       clearTimeout(giveUp);
       if (recognition.current !== rec) return; // superseded or cancelled
       recognition.current = null;
-      const text = finalText.trim();
-      if (text) void send(text);
-      else setPhase("idle");
+      const text = heardSoFar.trim();
+      if (text) {
+        void send(text);
+      } else {
+        setPhase("idle");
+        setNotice((n) => n ?? "I didn't hear anything. Tap the circle when you're ready.");
+      }
     };
 
     recognition.current = rec;
@@ -204,13 +267,13 @@ function Conversation({
       };
       speechTimer.current = setTimeout(done, window.speechSynthesis ? estimate + 4000 : estimate);
       if (!window.speechSynthesis) return;
-      const u = new SpeechSynthesisUtterance(text);
-      u.rate = 0.92;
-      const voice = pickVoice();
-      if (voice) u.voice = voice;
-      u.onend = done;
-      u.onerror = done;
-      window.speechSynthesis.speak(u);
+      void theVoice().then((v) => {
+        if (generation !== speechGeneration.current) return; // stopped while voices loaded
+        const u = utterance(text, v);
+        u.onend = done;
+        u.onerror = done;
+        window.speechSynthesis.speak(u);
+      });
     },
     [stopAudio],
   );
@@ -225,8 +288,16 @@ function Conversation({
   );
 
   const afterSpeaking = useCallback(() => {
-    if (voiceMode.current) listen();
-    else setPhase("idle");
+    if (!voiceMode.current) {
+      setPhase("idle");
+      return;
+    }
+    // Short gap first: the speaker's tail end, or its echo in the room, was
+    // being transcribed as the senior's answer.
+    const generation = speechGeneration.current;
+    setTimeout(() => {
+      if (generation === speechGeneration.current && voiceMode.current) listen();
+    }, LISTEN_DELAY_MS);
   }, [listen]);
 
   async function send(text: string) {
@@ -235,23 +306,39 @@ function Conversation({
     messagesRef.current = next;
     setHeard("");
     setPhase("thinking");
-    try {
-      const res = await fetch(`/api/seniors/${seniorId}/check-in/reply`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ messages: next }),
-      });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body?.error ?? "No reply");
-      const withReply: Message[] = [...next, { from: "assistant", text: body.reply }];
-      setMessages(withReply);
-      messagesRef.current = withReply;
-      if (body.emergency) setEmergency(body.emergency);
-      speak(body.reply, afterSpeaking);
-    } catch {
-      // Not added to the conversation: the model never said it.
-      speak("Sorry, I didn't catch that. Could you say it again?", afterSpeaking);
+
+    // One quiet retry for a server-side failure (a busy model, a cold
+    // start) before telling the senior anything.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await fetch(`/api/seniors/${seniorId}/check-in/reply`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ messages: next }),
+          signal: AbortSignal.timeout(45_000),
+        });
+        const body = await res.json().catch(() => null);
+        if (!res.ok || typeof body?.reply !== "string") {
+          console.warn(`[check-in] reply failed (${res.status}):`, body?.error ?? "no body");
+          if (res.status >= 500 && attempt === 1) continue;
+          break;
+        }
+        const withReply: Message[] = [...next, { from: "assistant", text: body.reply }];
+        setMessages(withReply);
+        messagesRef.current = withReply;
+        if (body.emergency) setEmergency(body.emergency);
+        speak(body.reply, afterSpeaking);
+        return;
+      } catch (error) {
+        console.warn("[check-in] reply failed:", error);
+        if (attempt === 1) continue;
+      }
     }
+
+    // Not added to the conversation: the model never said it. Says the
+    // fault is ours, because it is; "I didn't catch that" blamed the senior's
+    // speech for a server problem.
+    speak("Sorry, I lost my train of thought for a moment. Could you tell me that once more?", afterSpeaking);
   }
 
   async function finish() {
@@ -272,11 +359,8 @@ function Conversation({
       // Spoken directly rather than through speak(), which would flip the
       // screen back to the orb while it talks.
       if (window.speechSynthesis) {
-        const thanks = new SpeechSynthesisUtterance(`Thank you, ${firstName}. I've sent a note to your family.`);
-        thanks.rate = 0.92;
-        const voice = pickVoice();
-        if (voice) thanks.voice = voice;
-        window.speechSynthesis.speak(thanks);
+        const line = `Thank you, ${firstName}. I've sent a note to your family.`;
+        void theVoice().then((v) => window.speechSynthesis.speak(utterance(line, v)));
       }
       router.refresh();
     } catch (error) {
